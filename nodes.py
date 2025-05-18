@@ -1,219 +1,220 @@
 """
-Communication System between Nodes
-Description:
-Implementation of a distributed system where various nodes act simultaneously
-as clients and servers, allowing messages to be sent, received and stored.
-
-Characteristics:
--Bidirectional communication between nodes
--Local storage of message history
--Automatic confirmation response
--Timestamp include in each message
-- User interface for each console
-
-Authors:
-Mendoza Flores Axel Fernando
-Sergio Jair
-Leysha
-
-Date: 17/ 04/ 2025
+Communication System between Nodes - Versión Corregida
+Implementación de un sistema distribuido con confirmación de mensajes
 """
 
 import socket
 import threading
 import json
-#import time
 from datetime import datetime
-#ip = '192.168.122.35'
+
 class Node:
-    """
-    Class that represents an individual node
-
-    Attributes:
-        id_node(int): ID of the node
-        port (int): Port where the server is listening
-        more_nodes (list): List of nodes ports available
-        messages (dict): Dictionary of  sent/received messages
-        server (socket): Server socket instance
-
-    """
-    def _init_(self, id_node, port, more_nodes):
+    def __init__(self, id_node, port, nodes_info, node_ip='0.0.0.0', server_ready_event=None, base_port=5000):
         """
-        New instance of Node.
-
         Args:
-            id_node (int): ID of the node
-            port (int): Port where the server is listening
-            more_nodes (list): List of nodes ports available
+            id_node: Identificador único del nodo (1, 2, 3...)
+            port: Puerto de escucha
+            nodes_info: Diccionario {puerto: ip} de nodos disponibles
+            node_ip: IP del nodo
+            server_ready_event: Evento para sincronización
+            base_port: Puerto base para cálculo de IDs
         """
         self.id_node = id_node
         self.port = port
-        self.more_nodes = more_nodes
-        self.messages = [] #Almacenamiento de mensajes
+        self.ip = node_ip
+        self.nodes_info = nodes_info
+        self.messages = []
         self.server = None
+        self.server_ready_event = server_ready_event
+        self.base_port = base_port
 
     def start_server(self):
-        """Start The TCP server in a separate thread
-
-        Listening entry connections and creates a new thread
-        for each received connection.
-
-        The server executes in second plane allowing program finishing although
-        thread still active.
-        """
-        with (socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s):
+        """Inicia el servidor TCP para recibir mensajes"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             self.server = s
-            s.bind(('0.0.0.0', self.port))
+            s.bind((self.ip, self.port))
             s.listen()
-            print(f"Receiving messages from {self.port}")
-
+            print(f"Node {self.id_node} Server is ready and listening on {self.ip}:{self.port}")
+            if self.server_ready_event:
+                self.server_ready_event.set()
 
             while True:
                 try:
                     conn, addr = s.accept()
-                    #New thread for each connection
                     threading.Thread(
                         target=self.handle_connection,
-                        args=(conn,),
+                        args=(conn, addr),
                         daemon=True
                     ).start()
                 except Exception as e:
-                    print(f"[Node {self.id_node}] Error accepting connection: {e}")
+                    print(f"[Node {self.id_node}] Server error: {e}")
 
-    def handle_connection(self, conn):
-        """Handles an incoming connection and process received message
-
-        Args:
-            conn (socket): Cliente connection Object
-
-        Process:
-        1. Receive and decode message
-        2. Store message
-        3. Send automatic confirmation to the sender
-        4. Close connection
-
-        """
+    def handle_connection(self, conn, addr):
+        """Maneja una conexión entrante"""
         with conn:
             try:
                 data = conn.recv(1024).decode()
-                message = json.loads(data)
-                print(f"Node {self.id_node} received: {message['content']} from {message['origin']}")
+                if not data:
+                    return
 
-                #Save received message
+                message = json.loads(data)
+                hour = datetime.fromisoformat(message['timestamp']).strftime("%H:%M:%S")
+                print(f"[Node {self.id_node}] Received from {message['origin']} at {hour}: {message['content']}")
+
                 self.messages.append(message)
 
-                #Automatic export after save each message
-                if len(self.messages) % 5 == 0: #Each five messages
-                    self.export_history()
+                # Enviar ACK al puerto correcto
+                if not message['content'].startswith("ACK:"):
+                    ack = {
+                        'origin': self.id_node,
+                        'destination': self.base_port + message['origin'],  # Calcula puerto destino
+                        'content': f"ACK: {message['content']}",
+                        'timestamp': datetime.now().isoformat()
+                    }
 
-                #Auto confirmation response
-                response = {
-                    'origin' : self.id_node,
-                    'destiny' : message['destiny'],
-                    'content' : f"Received:: {message['content']}",
-                    'timestamp' : datetime.now().isoformat()
-                }
-                self.send_message(response)
+                    if self.send_message(ack):
+                        print(f"[Node {self.id_node}] ACK sent to {message['origin']}: {ack['content']}")
+                    else:
+                        print(f"[Node {self.id_node}] Failed to send ACK to {message['origin']}")
+
             except json.JSONDecodeError:
-                print(f"[Node {self.id_node}] Error message]")
+                print(f"[Node {self.id_node}] Invalid message format")
+            except Exception as e:
+                print(f"[Node {self.id_node}] Connection error: {e}")
 
     def send_message(self, message_dict):
-        """Send message to other node
-        Args:
-        message_dict (dict): Dictionary of message
-
-        Expected structure:
-        {
-        'origin' : int, # ID origin node
-        'destiny' : int, # Port destiny node
-        'content' : str, # Content of message
-        'timestamp' : int, # ISO format timestamp
-        }
-        The message is serialized to JSON before being sent.
-        """
+        """Envía un mensaje a otro nodo"""
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((message_dict['destiny_ip'], message_dict['destiny_port']))
-                s.sendall(json.dumps(message_dict).encode())
+            dest_port = message_dict['destination']
+            if dest_port == self.port:
+                print(f"[Node {self.id_node}] Warning: Cannot send message to self.")
+                return False
 
-                #Save message sent
+            dest_ip = self.nodes_info.get(dest_port)
+            if not dest_ip:
+                print(f"[Node {self.id_node}] Error: Unknown destination port {dest_port}")
+                return False
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5.0)
+
+                s.connect((dest_ip, dest_port))
+
+                message_dict['origin'] = self.id_node
+                message_dict['timestamp'] = datetime.now().isoformat()
+
+                s.sendall(json.dumps(message_dict).encode('utf-8'))
                 self.messages.append(message_dict)
-                print(f"[Node {self.id_node}] Message sent to {message_dict['destiny']}")
+                print(f"[Node {self.id_node}] Sent to {dest_port}: {message_dict['content']}")
+                return True
 
         except ConnectionRefusedError:
-            print(f"[Node {self.id_node}] Error: Destiny error {message_dict['destiny']} not available")
+            print(f"[Node {self.id_node}] Error: Node {dest_port - self.base_port} not available")
+        except socket.timeout:
+            print(f"[Node {self.id_node}] Error: Connection timeout with node {dest_port - self.base_port}")
         except Exception as e:
-            print(f"Error sending the message: {e}")
+            print(f"[Node {self.id_node}] Send error: {e}")
+        
+        return False
 
     def user_interface(self):
-        """Commandline to send messages
+        """Interfaz de línea de comandos"""
+        print(f"\nNode {self.id_node} - Command Interface")
+        print("=" * 40)
 
-        Show a menu allowing:
-        1. Select destiny node
-        2. Type text for the message
-        3. Send the message
-        """
-
-        #Thread for messages sent by the user
         while True:
             try:
-                print("Available nodes: ", self.more_nodes)
-                destiny = int(input(f"Send to (options: {self.more_nodes}): )"))
-                if destiny not in self.more_nodes:
-                    print("Invalid destiny node")
-                    continue
+                print("\nOptions:")
+                print("1. Send message")
+                print("2. View message history")
+                print("3. Export history")
+                print("4. Exit")
 
-                content = input("Type your message: ").strip()
-                if not content:
-                    print("Error: Message cannot be empty")
-                    continue
+                choice = input("Select option: ").strip()
 
-                #Build message structure
-                message = {
-                    'destiny_port' : self.port,
-                    'destiny_ip' : destiny,
-                    'content' : content,
-                    'timestamp' : datetime.now().isoformat()
-                }
-                self.send_message(message)
-            except ValueError:
-                print("Error: Type a node number valid")
+                if choice == "1":
+                    self._send_message_ui()
+                elif choice == "2":
+                    self._show_history()
+                elif choice == "3":
+                    self.export_history()
+                elif choice == "4":
+                    print("Exiting...")
+                    break
+                else:
+                    print("Invalid option")
+
             except Exception as e:
-                print(f"unexpect error: {e}")
+                print(f"Error: {e}")
+
+    def _send_message_ui(self):
+        """Maneja el envío de mensajes desde la UI"""
+        available_ids = [p - self.base_port for p in self.nodes_info.keys()]
+        print("\nAvailable node IDs:", available_ids)
+        try:
+            dest_node_id = int(input("Destination node ID: "))
+            dest_port = self.base_port + dest_node_id
+            
+            if dest_port not in self.nodes_info:
+                print("Error: Invalid destination node ID")
+                return
+
+            content = input("Message: ").strip()
+            if not content:
+                print("Error: Message cannot be empty")
+                return
+
+            message = {
+                'destination': dest_port,
+                'content': content
+            }
+            self.send_message(message)
+
+        except ValueError:
+            print("Error: Please enter a valid node ID")
+
+    def _show_history(self):
+        """Muestra el historial de mensajes"""
+        print("\nMessage History:")
+        print("=" * 40)
+        for i, msg in enumerate(self.messages, 1):
+            direction = f"{msg.get('origin', '?')} -> {msg['destination'] - self.base_port}"
+            print(f"{i}. [{msg['timestamp']}] {direction}: {msg['content']}")
 
     def export_history(self):
-        """Export the history to a JSON file"""
-        filename = f"history_{self.id_node}.json"
-        with open(filename, 'w') as f:
-            json.dump(self.messages, f, ident=2)
-        print(f"History exported to {filename}")
+        """Exporta el historial a JSON"""
+        filename = f"node_{self.id_node}_history.json"
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'node_id': self.id_node,
+                    'timestamp': datetime.now().isoformat(),
+                    'messages': self.messages
+                }, f, indent=2, ensure_ascii=False)
+            print(f"History exported to {filename}")
+        except Exception as e:
+            print(f"Export failed: {e}")
 
+if __name__ == "__main__":
+    # Configuración - CAMBIAR POR CADA NODO
+    NODE_ID = 1  # Cambiar este valor (1, 2, 3...)
+    BASE_PORT = 5000
+    NODE_IPS = {
+        5001: '192.168.100.62',
+        5002: '192.168.100.63',
+        5003: '192.168.100.64',
+        5004: '192.168.100.65'
+    }
 
-if _name_ == "_main_":
-    """Required configuration:
-    -ID for each node
-    - Base port (+ ID = binding)
-    -List of node ports 
-    
-    Example for 4 nodes (run in separate terminals):
-    Node 1: nodes.py (port 5001)
-    Node 2: nodes.py (port 5002)
-    Node 3: nodes.py (port 5003)
-    Node 4: nodes.py (port 5004)
-    
-    """
+    server_ready = threading.Event()
+    node = Node(
+        id_node=NODE_ID,
+        port=BASE_PORT + NODE_ID,
+        nodes_info={p: ip for p, ip in NODE_IPS.items() if p != BASE_PORT + NODE_ID},
+        server_ready_event=server_ready,
+        base_port=BASE_PORT
+    )
 
-    id_node = 2
-    port = 5000 + id_node
-    more_nodes = [p for p in range(5001,5005) if p != port ]
-
-    node = Node(id_node, port, more_nodes)
-
-    #start server in another thread
-    threading.Thread(
-        target=node.start_server,
-        daemon=True
-    ).start()
-
-    #start  user interface
+    threading.Thread(target=node.start_server, daemon=True).start()
+    server_ready.wait()
     node.user_interface()
