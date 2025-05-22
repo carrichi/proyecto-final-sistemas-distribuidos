@@ -7,6 +7,8 @@ import socket
 import threading
 import json
 from datetime import datetime
+import sqlite3
+
 
 class Node:
     def __init__(self, id_node, port, nodes_info, node_ip='0.0.0.0', server_ready_event=None, base_port=5000):
@@ -27,6 +29,9 @@ class Node:
         self.server = None
         self.server_ready_event = server_ready_event
         self.base_port = base_port
+        self.db_name = f"node_{self.id_node}.db"
+        self._init_db()
+
 
     def start_server(self):
         """Inicia el servidor TCP para recibir mensajes"""
@@ -49,6 +54,27 @@ class Node:
                 except Exception as e:
                     print(f"[Node {self.id_node}] Server error: {e}")
 
+    def _init_db(self):
+        """Inicializa la base de datos y crea la tabla si no existe"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    origin INTEGER,
+                    destination INTEGER,
+                    content TEXT,
+                    timestamp TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+            print(f"[Node {self.id_node}] Database initialized.")
+        except Exception as e:
+            print(f"[Node {self.id_node}] DB init error: {e}")
+
+
     def handle_connection(self, conn, addr):
         """Maneja una conexión entrante"""
         with conn:
@@ -62,6 +88,8 @@ class Node:
                 print(f"[Node {self.id_node}] Received from {message['origin']} at {hour}: {message['content']}")
 
                 self.messages.append(message)
+
+                self._save_message_to_db(message_dict)
 
                 # Enviar ACK al puerto correcto
                 if not message['content'].startswith("ACK:"):
@@ -81,6 +109,45 @@ class Node:
                 print(f"[Node {self.id_node}] Invalid message format")
             except Exception as e:
                 print(f"[Node {self.id_node}] Connection error: {e}")
+
+    def _save_message_to_db(self, msg):
+        """Guarda un mensaje en la base de datos"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO messages (origin, destination, content, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (
+                msg.get('origin', self.id_node),
+                msg.get('destination'),
+                msg.get('content'),
+                msg.get('timestamp', datetime.now().isoformat())
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[Node {self.id_node}] DB insert error: {e}")
+
+    
+    def _show_history(self):
+        """Muestra el historial de mensajes desde la base de datos"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            cursor.execute("SELECT origin, destination, content, timestamp FROM messages ORDER BY id ASC")
+            rows = cursor.fetchall()
+            conn.close()
+
+            print("\nMessage History (from DB):")
+            print("=" * 40)
+            for i, (origin, dest, content, ts) in enumerate(rows, 1):
+                print(f"{i}. [{ts}] {origin} -> {dest - self.base_port}: {content}")
+
+        except Exception as e:
+            print(f"[Node {self.id_node}] Error reading history: {e}")
+
+    
 
     def send_message(self, message_dict):
         """Envía un mensaje a otro nodo"""
@@ -128,7 +195,8 @@ class Node:
                 print("1. Send message")
                 print("2. View message history")
                 print("3. Export history")
-                print("4. Exit")
+                print("4. View DB messages")
+                print("5. Exit")
 
                 choice = input("Select option: ").strip()
 
@@ -139,8 +207,11 @@ class Node:
                 elif choice == "3":
                     self.export_history()
                 elif choice == "4":
+                    self._show_db_messages()
+                elif choice == "5":
                     print("Exiting...")
                     break
+
                 else:
                     print("Invalid option")
 
@@ -194,6 +265,16 @@ class Node:
             print(f"History exported to {filename}")
         except Exception as e:
             print(f"Export failed: {e}")
+
+    def _show_db_messages(self):
+        """Muestra los mensajes guardados en la base de datos"""
+        self.cursor.execute("SELECT origin, destination, content, timestamp FROM messages")
+        rows = self.cursor.fetchall()
+        print("\nDatabase Messages:")
+        for i, row in enumerate(rows, 1):
+            origin, destination, content, timestamp = row
+            print(f"{i}. [{timestamp}] {origin} -> {destination - self.base_port}: {content}")
+            
 
 if __name__ == "__main__":
     # Configuración - CAMBIAR POR CADA NODO
