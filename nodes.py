@@ -8,7 +8,7 @@ import threading
 import json
 from datetime import datetime
 import sqlite3
-
+import time
 
 class Node:
     def __init__(self, id_node, port, nodes_info, node_ip='0.0.0.0', server_ready_event=None, base_port=5000):
@@ -31,8 +31,128 @@ class Node:
         self.base_port = base_port
         self.db_name = f"node_{self.id_node}.db"
         self._init_db()
+        self.clock = 0  # Reloj lógico Lamport
+        self.request_queue = []  # Cola de solicitudes pendientes
+        self.in_critical_section = False  # Indica si el nodo está en la sección crítica
+        self.replies_received = 0  # Contador de respuestas REPLY
 
+    def increment_clock(self):
+        """Incrementa el reloj lógico"""
+        self.clock += 1
 
+    def synchronize_clock(self, received_clock):
+        """Sincroniza el reloj lógico con un valor recibido"""
+        self.clock = max(self.clock, received_clock) + 1
+
+    def request_critical_section(self, timeout=5):
+        """Solicita acceso a la sección crítica con un timeout"""
+        self.increment_clock()
+        self.in_critical_section = True
+        self.replies_received = 0
+        self.pending_replies = len(self.nodes_info)  # Número de nodos de los que se espera respuesta
+
+        # Enviar mensaje REQUEST a todos los nodos
+        for port, ip in self.nodes_info.items():
+            message = {
+                'type': 'REQUEST',
+                'clock': self.clock,
+                'origin': self.id_node,
+                'timestamp': datetime.now().isoformat()
+            }
+            if self.send_message({
+                'destination': port,
+                'content': json.dumps(message)
+            }):
+                print(f"[Node {self.id_node}] Sent REQUEST to Node {port - self.base_port}")
+            else:
+                print(f"[Node {self.id_node}] Failed to send REQUEST to Node {port - self.base_port}")
+                self.pending_replies -= 1  # Reducir el número de respuestas esperadas si el nodo no está disponible
+
+        # Esperar respuestas con un timeout
+        start_time = time.time()
+        while self.replies_received < self.pending_replies:
+            if time.time() - start_time > timeout:
+                print(f"[Node {self.id_node}] Timeout waiting for replies. Aborting critical section request.")
+                print(f"[Node {self.id_node}] Received {self.replies_received} replies out of {self.pending_replies} expected.")
+                self.in_critical_section = False
+                return  # Abortamos si no recibimos suficientes respuestas
+            time.sleep(0.1)  # Esperar un breve momento antes de verificar nuevamente
+
+        # Si se recibieron suficientes respuestas, entrar en la sección crítica
+        if self.replies_received >= self.pending_replies:
+            print(f"[Node {self.id_node}] Received all necessary replies. Entering critical section.")
+            self.enter_critical_section()
+
+    def handle_request(self, message):
+        """Maneja un mensaje REQUEST recibido"""
+        self.synchronize_clock(message['clock'])
+        origin = message['origin']
+
+        # Responder con REPLY si no estoy en la sección crítica o si mi solicitud tiene menor prioridad
+        if not self.in_critical_section or (self.clock, self.id_node) > (message['clock'], origin):
+            reply_message = {
+                'type': 'REPLY',
+                'clock': self.clock,
+                'origin': self.id_node,
+                'timestamp': datetime.now().isoformat()
+            }
+            self.send_message({
+                'destination': self.base_port + origin,
+                'content': json.dumps(reply_message)
+            })
+            print(f"[Node {self.id_node}] Sent REPLY to Node {origin}.")
+        else:
+            # Agregar la solicitud a la cola
+            self.request_queue.append(message)
+
+    def handle_reply(self, message):
+        """Maneja un mensaje REPLY recibido"""
+        self.synchronize_clock(message['clock'])
+        self.replies_received += 1
+        print(f"[Node {self.id_node}] Received REPLY from Node {message['origin']}. Total replies: {self.replies_received}")
+    
+    def enter_critical_section(self):
+        """Entra en la sección crítica"""
+        print(f"[Node {self.id_node}] In critical section.")
+        # Aquí puedes realizar la operación crítica (por ejemplo, comprar un artículo)
+        self.purchase_item()
+
+        # Salir de la sección crítica
+        self.exit_critical_section()
+
+    def exit_critical_section(self):
+        """Sale de la sección crítica"""
+        print(f"[Node {self.id_node}] Exiting critical section.")
+        self.in_critical_section = False
+
+        # Responder a las solicitudes pendientes en la cola
+        while self.request_queue:
+            pending_request = self.request_queue.pop(0)
+            self.handle_request(pending_request)
+
+    def _purchase_item_ui(self):
+        """Interfaz para comprar un artículo con exclusión mutua"""
+        try:
+            item_id = int(input("Enter the item ID to purchase: "))
+            quantity = int(input("Enter the quantity to purchase: "))
+
+            # Define la lógica de compra como un método interno
+            def purchase_item():
+                if self.update_inventory(item_id, -quantity):
+                    print(f"Purchased {quantity} of item {item_id}.")
+                else:
+                    print(f"Failed to purchase item {item_id}.")
+
+            # Asigna la lógica de compra al atributo `self.purchase_item`
+            self.purchase_item = purchase_item
+
+            # Solicitar acceso a la sección crítica
+            self.request_critical_section()
+
+        except ValueError:
+            print("Invalid input. Please enter numeric values.")
+
+            
     def start_server(self):
         """Inicia el servidor TCP para recibir mensajes"""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -55,10 +175,11 @@ class Node:
                     print(f"[Node {self.id_node}] Server error: {e}")
 
     def _init_db(self):
-        """Inicializa la base de datos y crea la tabla si no existe"""
+        """Inicializa la base de datos y crea las tablas si no existen"""
         try:
             conn = sqlite3.connect(self.db_name)
             cursor = conn.cursor()
+            # Crear tabla de mensajes
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +187,16 @@ class Node:
                     destination INTEGER,
                     content TEXT,
                     timestamp TEXT
+                )
+            """)
+            # Crear tabla de inventario
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS inventory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    quantity INTEGER,
+                    price REAL,
+                    last_updated TEXT
                 )
             """)
             conn.commit()
@@ -110,6 +241,64 @@ class Node:
             except Exception as e:
                 print(f"[Node {self.id_node}] Connection error: {e}")
 
+    def show_inventory(self):
+        """Muestra el inventario local"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, quantity, price, last_updated FROM inventory")
+            rows = cursor.fetchall()
+            conn.close()
+
+            print("\nLocal Inventory:")
+            print("=" * 40)
+            for row in rows:
+                print(f"ID: {row[0]}, Name: {row[1]}, Quantity: {row[2]}, Price: {row[3]}, Last Updated: {row[4]}")
+        except Exception as e:
+            print(f"[Node {self.id_node}] Error reading inventory: {e}")
+
+    def update_inventory(self, item_id, quantity_change):
+        """Actualiza la cantidad de un artículo en el inventario"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            cursor.execute("SELECT quantity FROM inventory WHERE id = ?", (item_id,))
+            result = cursor.fetchone()
+            if result:
+                new_quantity = result[0] + quantity_change
+                if new_quantity < 0:
+                    print(f"[Node {self.id_node}] Error: Not enough stock for item {item_id}")
+                    return False
+                cursor.execute("""
+                    UPDATE inventory
+                    SET quantity = ?, last_updated = ?
+                    WHERE id = ?
+                """, (new_quantity, datetime.now().isoformat(), item_id))
+                conn.commit()
+                print(f"[Node {self.id_node}] Inventory updated for item {item_id}")
+            else:
+                print(f"[Node {self.id_node}] Error: Item {item_id} not found in inventory")
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"[Node {self.id_node}] Error updating inventory: {e}")
+            return False
+
+    def sync_inventory(self):
+        """Sincroniza el inventario con otros nodos"""
+        for port, ip in self.nodes_info.items():
+            try:
+                message = {
+                    'origin': self.id_node,
+                    'destination': port,
+                    'content': 'SYNC_INVENTORY',
+                    'timestamp': datetime.now().isoformat()
+                }
+                if self.send_message(message):
+                    print(f"[Node {self.id_node}] Sync request sent to Node {port - self.base_port}")
+            except Exception as e:
+                print(f"[Node {self.id_node}] Error syncing inventory with Node {port - self.base_port}: {e}")
+
     def _save_message_to_db(self, msg):
         """Guarda un mensaje en la base de datos"""
         try:
@@ -147,7 +336,6 @@ class Node:
         except Exception as e:
             print(f"[Node {self.id_node}] Error reading history: {e}")
 
-    
 
     def send_message(self, message_dict):
         """Envía un mensaje a otro nodo"""
@@ -194,9 +382,15 @@ class Node:
                 print("\nOptions:")
                 print("1. Send message")
                 print("2. View message history")
-                print("3. Export history")
+                print("3. Export message history")
                 print("4. View DB messages")
-                print("5. Exit")
+                print("5. Show inventory")
+                print("6. Update inventory")
+                print("7. Sync inventory with other nodes")
+                print("8. Add new client")
+                print("9. View client list")
+                print("10. Purchase an item (with mutual exclusion)")
+                print("11. Exit")
 
                 choice = input("Select option: ").strip()
 
@@ -209,9 +403,20 @@ class Node:
                 elif choice == "4":
                     self._show_db_messages()
                 elif choice == "5":
+                    self.show_inventory()
+                elif choice == "6":
+                    self._update_inventory_ui()
+                elif choice == "7":
+                    self.sync_inventory()
+                elif choice == "8":
+                    self._add_client_ui()
+                elif choice == "9":
+                    self._view_clients()
+                elif choice == "10":
+                    self._purchase_item_ui()
+                elif choice == "11":
                     print("Exiting...")
                     break
-
                 else:
                     print("Invalid option")
 
