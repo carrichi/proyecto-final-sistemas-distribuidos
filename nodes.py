@@ -2,7 +2,7 @@
 Communication System between Nodes - Versión Corregida
 Implementación de un sistema distribuido con confirmación de mensajes
 """
-
+import os
 import socket
 import threading
 import json
@@ -74,7 +74,6 @@ class Node:
         except Exception as e:
             print(f"[Node {self.id_node}] DB init error: {e}")
 
-
     def handle_connection(self, conn, addr):
         """Maneja una conexión entrante"""
         with conn:
@@ -89,7 +88,8 @@ class Node:
 
                 self.messages.append(message)
 
-                self._save_message_to_db(message_dict)
+                # Guardar el mensaje en la base de datos
+                self._save_message_to_db(message)
 
                 # Enviar ACK al puerto correcto
                 if not message['content'].startswith("ACK:"):
@@ -268,23 +268,30 @@ class Node:
 
     def _show_db_messages(self):
         """Muestra los mensajes guardados en la base de datos"""
-        self.cursor.execute("SELECT origin, destination, content, timestamp FROM messages")
-        rows = self.cursor.fetchall()
-        print("\nDatabase Messages:")
-        for i, row in enumerate(rows, 1):
-            origin, destination, content, timestamp = row
-            print(f"{i}. [{timestamp}] {origin} -> {destination - self.base_port}: {content}")
-            
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            cursor.execute("SELECT origin, destination, content, timestamp FROM messages")
+            rows = cursor.fetchall()
+            conn.close()
 
+            print("\nDatabase Messages:")
+            for i, row in enumerate(rows, 1):
+                origin, destination, content, timestamp = row
+                print(f"{i}. [{timestamp}] {origin} -> {destination - self.base_port}: {content}")
+        except Exception as e:
+            print(f"[Node {self.id_node}] Error reading messages from DB: {e}")
+
+        
 if __name__ == "__main__":
     # Configuración - CAMBIAR POR CADA NODO
-    NODE_ID = 1  # Cambiar este valor (1, 2, 3...)
+    NODE_ID = int(os.getenv("NODE_ID", 1))  # Toma el valor de la variable de entorno NODE_ID, por defecto 1  # Cambiar este valor (1, 2, 3...)
     BASE_PORT = 5000
     NODE_IPS = {
-        5001: '192.168.100.62',
-        5002: '192.168.100.63',
-        5003: '192.168.100.64',
-        5004: '192.168.100.65'
+        5001: '192.168.100.61',
+        5002: '192.168.100.62',
+        5003: '192.168.100.63',
+        5004: '192.168.100.64'
     }
 
     server_ready = threading.Event()
