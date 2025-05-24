@@ -125,7 +125,7 @@ class Node:
         print(f"[Node {self.id_node}] Exiting critical section.")
         self.in_critical_section = False
 
-        # Responder a las solicitudes pendientes en la cola
+        # Responder a las solicitudes pendientes en la col
         while self.request_queue:
             pending_request = self.request_queue.pop(0)
             self.handle_request(pending_request)
@@ -151,6 +151,38 @@ class Node:
 
         except ValueError:
             print("Invalid input. Please enter numeric values.")
+
+    def propagate_inventory_update(self, item_id, new_quantity):
+        """Propaga la actualización de inventario a los demás nodos y espera confirmaciones"""
+        confirmations = 1  # Ya está confirmado localmente
+        total_nodes = len(self.nodes_info) + 1  # Incluye este nodo
+
+        update_message = {
+            'type': 'INVENTORY_UPDATE',
+            'item_id': item_id,
+            'new_quantity': new_quantity,
+            'origin': self.id_node,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        for port, ip in self.nodes_info.items():
+            try:
+                msg = {
+                    'destination': port,
+                    'content': json.dumps(update_message)
+                }
+                if self.send_message(msg):
+                    confirmations += 1
+            except Exception as e:
+                print(f"[Node {self.id_node}] Error sending inventory update to Node {port - self.base_port}: {e}")
+
+        # Consenso simple: mayoría
+        if confirmations >= (total_nodes // 2) + 1:
+            print(f"[Node {self.id_node}] Inventory update confirmed by majority ({confirmations}/{total_nodes})")
+            return True
+        else:
+            print(f"[Node {self.id_node}] Inventory update NOT confirmed by majority ({confirmations}/{total_nodes})")
+            return False
 
             
     def start_server(self):
@@ -222,11 +254,31 @@ class Node:
                 # Guardar el mensaje en la base de datos
                 self._save_message_to_db(message)
 
+                # Procesar mensaje INVENTORY_UPDATE
+                try:
+                    content = message['content']
+                    # Si el mensaje es un dict (ya decodificado), úsalo directamente
+                    if isinstance(content, dict):
+                        msg_type = content.get('type')
+                    else:
+                        # Si es string, intenta decodificarlo como JSON
+                        content = json.loads(content)
+                        msg_type = content.get('type')
+                except Exception:
+                    msg_type = None
+
+                if msg_type == 'INVENTORY_UPDATE':
+                    item_id = content['item_id']
+                    new_quantity = content['new_quantity']
+                    # Actualiza el inventario local SIN propagar
+                    self.update_inventory(item_id, new_quantity - self.get_item_quantity(item_id), propagate=False)
+                    print(f"[Node {self.id_node}] Inventory updated from INVENTORY_UPDATE for item {item_id}")
+
                 # Enviar ACK al puerto correcto
-                if not message['content'].startswith("ACK:"):
+                if not str(message['content']).startswith("ACK:"):
                     ack = {
                         'origin': self.id_node,
-                        'destination': self.base_port + message['origin'],  # Calcula puerto destino
+                        'destination': self.base_port + message['origin'],
                         'content': f"ACK: {message['content']}",
                         'timestamp': datetime.now().isoformat()
                     }
@@ -240,6 +292,22 @@ class Node:
                 print(f"[Node {self.id_node}] Invalid message format")
             except Exception as e:
                 print(f"[Node {self.id_node}] Connection error: {e}")
+
+    # Debes agregar este método auxiliar en tu clase Node:
+    def get_item_quantity(self, item_id):
+        """Obtiene la cantidad actual de un artículo en el inventario local"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            cursor.execute("SELECT quantity FROM inventory WHERE id = ?", (item_id,))
+            result = cursor.fetchone()
+            conn.close()
+            if result:
+                return result[0]
+            return 0
+        except Exception as e:
+            print(f"[Node {self.id_node}] Error getting item quantity: {e}")
+            return 0
 
     def show_inventory(self):
         """Muestra el inventario local"""
@@ -257,8 +325,8 @@ class Node:
         except Exception as e:
             print(f"[Node {self.id_node}] Error reading inventory: {e}")
 
-    def update_inventory(self, item_id, quantity_change):
-        """Actualiza la cantidad de un artículo en el inventario"""
+    def update_inventory(self, item_id, quantity_change, propagate=True):
+        """Actualiza la cantidad de un artículo en el inventario y propaga el cambio si es necesario"""
         try:
             conn = sqlite3.connect(self.db_name)
             cursor = conn.cursor()
@@ -276,6 +344,21 @@ class Node:
                 """, (new_quantity, datetime.now().isoformat(), item_id))
                 conn.commit()
                 print(f"[Node {self.id_node}] Inventory updated for item {item_id}")
+
+                # Propaga la actualización si es necesario
+                if propagate:
+                    success = self.propagate_inventory_update(item_id, new_quantity)
+                    if not success:
+                        print(f"[Node {self.id_node}] Rolling back inventory update for item {item_id}")
+                        # Rollback: restaurar cantidad anterior
+                        cursor.execute("""
+                            UPDATE inventory
+                            SET quantity = ?, last_updated = ?
+                            WHERE id = ?
+                        """, (result[0], datetime.now().isoformat(), item_id))
+                        conn.commit()
+                        conn.close()
+                        return False
             else:
                 print(f"[Node {self.id_node}] Error: Item {item_id} not found in inventory")
             conn.close()
